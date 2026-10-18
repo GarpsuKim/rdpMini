@@ -27,8 +27,8 @@ using std::max;
 #pragma pack(push, 1)
 struct Hdr { uint8_t type; uint32_t len; };
 #pragma pack(pop)
-struct Ev { int32_t t, a, b; };
-enum { MSG_AUTH = 1, MSG_FRAME = 2, MSG_INPUT = 3 };
+struct Ev { int32_t t, a, b, m; }; // m = monitor index (mouse move)
+enum { MSG_AUTH = 1, MSG_FRAME = 2, MSG_INPUT = 3, MSG_INFO = 4 };
 enum { EV_MOVE = 1, EV_BTN = 2, EV_WHEEL = 3 };
 
 static bool sendAll(SOCKET s, const void* p, int n) {
@@ -59,16 +59,28 @@ static bool getJpegClsid(CLSID* out) {
 }
 
 // ---------------------------------------------------------------- server
+static std::vector<RECT> gMons; // server monitors, sorted left to right
+static BOOL CALLBACK enumProc(HMONITOR, HDC, LPRECT r, LPARAM lp) {
+    ((std::vector<RECT>*)lp)->push_back(*r);
+    return TRUE;
+}
 static void inject(const Ev& e) {
     INPUT in[2] = {};
     int cnt = 1;
     switch (e.t) {
-    case EV_MOVE:
+    case EV_MOVE: { // a,b = 0..65535 inside monitor m -> virtual desktop coordinates
+        if (e.m < 0 || e.m >= (int)gMons.size()) return;
+        const RECT& r = gMons[e.m];
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (vw < 2 || vh < 2) return;
+        int px = r.left + (int)((int64_t)std::clamp(e.a, 0, 65535) * (r.right - r.left - 1) / 65535);
+        int py = r.top + (int)((int64_t)std::clamp(e.b, 0, 65535) * (r.bottom - r.top - 1) / 65535);
         in[0].type = INPUT_MOUSE;
-        in[0].mi.dx = std::clamp(e.a, 0, 65535);
-        in[0].mi.dy = std::clamp(e.b, 0, 65535);
+        in[0].mi.dx = (LONG)((int64_t)(px - vx) * 65535 / (vw - 1));
+        in[0].mi.dy = (LONG)((int64_t)(py - vy) * 65535 / (vh - 1));
         in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-        break;
+        break; }
     case EV_BTN: {
         DWORD f = (DWORD)e.a;
         if (f != MOUSEEVENTF_LEFTDOWN && f != MOUSEEVENTF_LEFTUP &&
@@ -110,6 +122,18 @@ static void serveClient(SOCKET c, const std::string& pw) {
     if (!ok) { printf("Auth failed or denied\n"); return; }
     printf("Client accepted\n");
 
+    gMons.clear();
+    EnumDisplayMonitors(NULL, NULL, enumProc, (LPARAM)&gMons);
+    std::sort(gMons.begin(), gMons.end(), [](const RECT& a, const RECT& b) {
+        return a.left != b.left ? a.left < b.left : a.top < b.top;
+    });
+    {   // tell the client how many monitors there are and their sizes
+        std::vector<int32_t> info;
+        info.push_back((int32_t)gMons.size());
+        for (auto& r : gMons) { info.push_back(r.right - r.left); info.push_back(r.bottom - r.top); }
+        sendMsg(c, MSG_INFO, info.data(), (uint32_t)(info.size() * 4));
+    }
+
     std::atomic<bool> alive(true);
     std::thread rx([&] {
         Hdr h;
@@ -129,28 +153,37 @@ static void serveClient(SOCKET c, const std::string& pw) {
 
     CLSID jpg;
     getJpegClsid(&jpg);
-    int VX = GetSystemMetrics(SM_XVIRTUALSCREEN), VY = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int W = GetSystemMetrics(SM_CXVIRTUALSCREEN), H = GetSystemMetrics(SM_CYVIRTUALSCREEN); // all monitors
-    HDC scr = GetDC(NULL), mem = CreateCompatibleDC(scr);
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = W;
-    bi.bmiHeader.biHeight = -H; // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(scr, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    HGDIOBJ old = SelectObject(mem, dib);
-    size_t bytes = (size_t)W * H * 4;
-    std::vector<uint8_t> prev(bytes, 0);
+    struct Mon { int W, H; HDC mem; HBITMAP dib; HGDIOBJ old; void* bits; size_t bytes; std::vector<uint8_t> prev; };
+    std::vector<Mon> mons(gMons.size());
+    HDC scr = GetDC(NULL);
+    for (size_t i = 0; i < mons.size(); i++) {
+        Mon& m = mons[i];
+        m.W = gMons[i].right - gMons[i].left;
+        m.H = gMons[i].bottom - gMons[i].top;
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = m.W;
+        bi.bmiHeader.biHeight = -m.H; // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        m.bits = nullptr;
+        m.mem = CreateCompatibleDC(scr);
+        m.dib = CreateDIBSection(scr, &bi, DIB_RGB_COLORS, &m.bits, NULL, 0);
+        m.old = SelectObject(m.mem, m.dib);
+        m.bytes = (size_t)m.W * m.H * 4;
+        m.prev.assign(m.bytes, 0);
+    }
     ULONG quality = 60;
 
     while (alive) {
-        BitBlt(mem, 0, 0, W, H, scr, VX, VY, SRCCOPY | CAPTUREBLT);
-        if (memcmp(prev.data(), bits, bytes) != 0) {
-            memcpy(prev.data(), bits, bytes);
-            Gdiplus::Bitmap bmp(W, H, W * 4, PixelFormat32bppRGB, (BYTE*)bits);
+        bool sentOk = true;
+        for (size_t i = 0; i < mons.size() && sentOk; i++) {
+            Mon& m = mons[i];
+            BitBlt(m.mem, 0, 0, m.W, m.H, scr, gMons[i].left, gMons[i].top, SRCCOPY | CAPTUREBLT);
+            if (memcmp(m.prev.data(), m.bits, m.bytes) == 0) continue; // this monitor unchanged
+            memcpy(m.prev.data(), m.bits, m.bytes);
+            Gdiplus::Bitmap bmp(m.W, m.H, m.W * 4, PixelFormat32bppRGB, (BYTE*)m.bits);
             IStream* st = nullptr;
             CreateStreamOnHGlobal(NULL, TRUE, &st);
             Gdiplus::EncoderParameters ep;
@@ -159,26 +192,30 @@ static void serveClient(SOCKET c, const std::string& pw) {
             ep.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
             ep.Parameter[0].NumberOfValues = 1;
             ep.Parameter[0].Value = &quality;
-            bool sent = true;
             if (bmp.Save(st, &jpg, &ep) == Gdiplus::Ok) {
                 STATSTG ss;
                 st->Stat(&ss, STATFLAG_NONAME);
                 HGLOBAL hg;
                 GetHGlobalFromStream(st, &hg);
                 void* p = GlobalLock(hg);
-                sent = sendMsg(c, MSG_FRAME, p, ss.cbSize.LowPart);
+                Hdr fh{MSG_FRAME, ss.cbSize.LowPart + 4}; // payload = monitor index + JPEG
+                int32_t idx = (int32_t)i;
+                sentOk = sendAll(c, &fh, sizeof fh) && sendAll(c, &idx, 4) &&
+                         sendAll(c, p, (int)ss.cbSize.LowPart);
                 GlobalUnlock(hg);
             }
             st->Release();
-            if (!sent) break;
         }
+        if (!sentOk) break;
         Sleep(60);
     }
     shutdown(c, SD_BOTH);
     rx.join();
-    SelectObject(mem, old);
-    DeleteObject(dib);
-    DeleteDC(mem);
+    for (Mon& m : mons) {
+        SelectObject(m.mem, m.old);
+        DeleteObject(m.dib);
+        DeleteDC(m.mem);
+    }
     ReleaseDC(NULL, scr);
     printf("Client disconnected\n");
 }
@@ -208,13 +245,18 @@ static int runServer(int port, const std::string& pw) {
 
 // ---------------------------------------------------------------- client
 static SOCKET gSock = INVALID_SOCKET;
-static HWND gWnd;
-static HBITMAP gBmp = NULL;
+static std::vector<HWND> gWnd;     // one window per server monitor
+static std::vector<HBITMAP> gBmp;  // latest frame per monitor
 static std::mutex gMtx;
 
-static void sendEv(int t, int a, int b = 0) {
-    Ev e{t, a, b};
+static void sendEv(int t, int a, int b = 0, int m = 0) {
+    Ev e{t, a, b, m};
     sendMsg(gSock, MSG_INPUT, &e, sizeof e);
+}
+
+static int monOf(HWND w) {
+    for (size_t i = 0; i < gWnd.size(); i++) if (gWnd[i] == w) return (int)i;
+    return -1;
 }
 
 static void netThread() {
@@ -223,9 +265,13 @@ static void netThread() {
         if (h.len > (64u << 20)) break;
         std::vector<char> buf(h.len);
         if (h.len && !recvAll(gSock, buf.data(), (int)h.len)) break;
-        if (h.type != MSG_FRAME) continue;
-        HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, h.len);
-        memcpy(GlobalLock(hg), buf.data(), h.len);
+        if (h.type != MSG_FRAME || h.len <= 4) continue;
+        int32_t idx;
+        memcpy(&idx, buf.data(), 4);
+        if (idx < 0 || idx >= (int)gWnd.size()) continue;
+        uint32_t n = h.len - 4;
+        HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, n);
+        memcpy(GlobalLock(hg), buf.data() + 4, n);
         GlobalUnlock(hg);
         IStream* st = nullptr;
         CreateStreamOnHGlobal(hg, TRUE, &st);
@@ -238,12 +284,12 @@ static void netThread() {
         if (!hb) continue;
         {
             std::lock_guard<std::mutex> lk(gMtx);
-            if (gBmp) DeleteObject(gBmp);
-            gBmp = hb;
+            if (gBmp[idx]) DeleteObject(gBmp[idx]);
+            gBmp[idx] = hb;
         }
-        InvalidateRect(gWnd, NULL, FALSE);
+        InvalidateRect(gWnd[idx], NULL, FALSE);
     }
-    PostMessage(gWnd, WM_CLOSE, 0, 0);
+    PostMessage(gWnd[0], WM_CLOSE, 0, 0);
 }
 
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
@@ -252,13 +298,15 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
         std::lock_guard<std::mutex> lk(gMtx);
-        if (gBmp) {
+        int mi = monOf(w);
+        HBITMAP cur = mi >= 0 ? gBmp[mi] : NULL;
+        if (cur) {
             BITMAP bm;
-            GetObject(gBmp, sizeof bm, &bm);
+            GetObject(cur, sizeof bm, &bm);
             RECT rc;
             GetClientRect(w, &rc);
             HDC mem = CreateCompatibleDC(dc);
-            HGDIOBJ o = SelectObject(mem, gBmp);
+            HGDIOBJ o = SelectObject(mem, cur);
             SetStretchBltMode(dc, HALFTONE);
             StretchBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
             SelectObject(mem, o);
@@ -274,7 +322,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if (rc.right > 1 && rc.bottom > 1) {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             sendEv(EV_MOVE, (int)((int64_t)x * 65535 / (rc.right - 1)),
-                            (int)((int64_t)y * 65535 / (rc.bottom - 1)));
+                            (int)((int64_t)y * 65535 / (rc.bottom - 1)), monOf(w));
         }
         return 0; }
     case WM_LBUTTONDOWN: SetCapture(w); sendEv(EV_BTN, MOUSEEVENTF_LEFTDOWN); return 0;
@@ -309,6 +357,16 @@ static int runClient(const char* ip, int port, const std::string& pw) {
         printf("Auth failed or connection denied\n");
         return 1;
     }
+    if (!recvAll(gSock, &h, sizeof h) || h.type != MSG_INFO || h.len < 12 || h.len > 4096 || h.len % 4) {
+        printf("Bad monitor info\n");
+        return 1;
+    }
+    std::vector<int32_t> info(h.len / 4);
+    if (!recvAll(gSock, info.data(), (int)h.len) || info[0] < 1 || (size_t)info[0] * 2 + 1 > info.size()) {
+        printf("Bad monitor info\n");
+        return 1;
+    }
+    int nMon = info[0];
 
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
@@ -316,8 +374,19 @@ static int runClient(const char* ip, int port, const std::string& pw) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.lpszClassName = L"RdpMini";
     RegisterClassW(&wc);
-    gWnd = CreateWindowW(L"RdpMini", L"rdp_mini", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720, NULL, NULL, wc.hInstance, NULL);
+    gWnd.assign(nMon, NULL);
+    gBmp.assign(nMon, NULL);
+    for (int i = 0; i < nMon; i++) { // one window per server monitor
+        int mw = info[1 + 2 * i], mh = info[2 + 2 * i];
+        int cw = std::min(mw, 1280), ch = (int)((int64_t)mh * cw / mw);
+        RECT rc = {0, 0, cw, ch};
+        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+        wchar_t title[64];
+        _snwprintf(title, 64, L"rdp_mini - monitor %d (%dx%d)", i + 1, mw, mh);
+        gWnd[i] = CreateWindowW(L"RdpMini", title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                                rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, wc.hInstance, NULL);
+    }
+    for (HWND w : gWnd) ShowWindow(w, SW_SHOW);
     std::thread t(netThread);
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) > 0) {
