@@ -1,7 +1,11 @@
 // rdp_mini.cpp - Minimal LAN remote control (Windows <-> Windows, mouse only)
 // Build: g++ -O2 -std=c++17 rdp_mini.cpp -o rdp_mini.exe -lgdiplus -lgdi32 -lws2_32 -lole32 -luser32
 // Run:
-//   controlled PC  : rdp_mini server 7070 password
+//   controlled PC  : rdp_mini server 7070 password [allowed_ip|any] [once|auto|always]
+//     allowed_ip : accept connections only from this IP ("any" = no restriction, default)
+//     accept mode: once   = ask the first time per client IP (default)
+//                  auto   = never ask
+//                  always = ask on every connection
 //   controlling PC : rdp_mini client 192.168.0.10 7070 password
 // Note: no TLS. Trusted internal network only.
 
@@ -99,6 +103,9 @@ static void inject(const Ev& e) {
     SendInput(cnt, in, sizeof(INPUT));
 }
 
+static std::string gAllowIp;   // empty = any client IP
+static int gAcceptMode = 0;    // 0 = once (ask the first time per IP), 1 = auto (never ask), 2 = always (ask every time)
+
 static void serveClient(SOCKET c, const std::string& pw) {
     Hdr h;
     if (!recvAll(c, &h, sizeof h) || h.type != MSG_AUTH || h.len > 256) return;
@@ -111,7 +118,9 @@ static void serveClient(SOCKET c, const std::string& pw) {
         int pl = sizeof pa;
         getpeername(c, (sockaddr*)&pa, &pl);
         std::string ips = inet_ntoa(pa.sin_addr);
-        if (!trusted.count(ips)) {
+        if (gAcceptMode == 1) {
+            // auto: no prompt
+        } else if (gAcceptMode == 2 || !trusted.count(ips)) {
             std::wstring msg = L"Remote connection request: " + std::wstring(ips.begin(), ips.end()) + L"\n\nAllow?";
             ok = MessageBoxW(NULL, msg.c_str(), L"rdp_mini",
                              MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
@@ -232,10 +241,19 @@ static int runServer(int port, const std::string& pw) {
         printf("Failed to open port %d\n", port);
         return 1;
     }
-    printf("Listening (port %d)\n", port);
+    printf("Listening (port %d, allowed IP: %s, accept mode: %s)\n", port,
+           gAllowIp.empty() ? "any" : gAllowIp.c_str(),
+           gAcceptMode == 1 ? "auto" : gAcceptMode == 2 ? "always" : "once");
     for (;;) {
-        SOCKET c = accept(ls, NULL, NULL);
+        sockaddr_in ca = {};
+        int cl = sizeof ca;
+        SOCKET c = accept(ls, (sockaddr*)&ca, &cl);
         if (c == INVALID_SOCKET) continue;
+        if (!gAllowIp.empty() && gAllowIp != inet_ntoa(ca.sin_addr)) {
+            printf("Rejected IP %s\n", inet_ntoa(ca.sin_addr));
+            closesocket(c);
+            continue;
+        }
         int nd = 1;
         setsockopt(c, IPPROTO_TCP, 1 /*TCP_NODELAY*/, (char*)&nd, sizeof nd);
         serveClient(c, pw);
@@ -407,12 +425,25 @@ int main(int argc, char** argv) {
     ULONG_PTR tok;
     Gdiplus::GdiplusStartup(&tok, &gi, NULL);
     int rc = 1;
-    if (argc == 4 && !strcmp(argv[1], "server"))
+    bool argsOk = true;
+    if (argc >= 4 && argc <= 6 && !strcmp(argv[1], "server")) {
+        if (argc >= 5 && strcmp(argv[4], "any") && strcmp(argv[4], "*")) {
+            if (inet_addr(argv[4]) == INADDR_NONE) argsOk = false;
+            else gAllowIp = argv[4];
+        }
+        if (argc == 6) {
+            if (!strcmp(argv[5], "once")) gAcceptMode = 0;
+            else if (!strcmp(argv[5], "auto")) gAcceptMode = 1;
+            else if (!strcmp(argv[5], "always")) gAcceptMode = 2;
+            else argsOk = false;
+        }
+    }
+    if (argsOk && argc >= 4 && argc <= 6 && !strcmp(argv[1], "server"))
         rc = runServer(atoi(argv[2]), argv[3]);
     else if (argc == 5 && !strcmp(argv[1], "client"))
         rc = runClient(argv[2], atoi(argv[3]), argv[4]);
     else
-        printf("Usage:\n  rdp_mini server <port> <password>\n  rdp_mini client <ip> <port> <password>\n");
+        printf("Usage:\n  rdp_mini server <port> <password> [allowed_ip|any] [once|auto|always]\n  rdp_mini client <ip> <port> <password>\n");
     Gdiplus::GdiplusShutdown(tok);
     WSACleanup();
     return rc;
